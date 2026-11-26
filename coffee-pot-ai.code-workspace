@@ -1,0 +1,14 @@
+{
+	"folders": [
+		{
+			"path": "../onnxruntime"
+		},
+		{
+			"path": "../../realtimelogic/esp-idf"
+		},
+		{
+			"path": "."
+		}
+	],
+	"settings": {}
+}
