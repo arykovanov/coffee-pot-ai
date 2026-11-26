@@ -48,11 +48,22 @@ dependencies:
     source:
       type: idf
     version: 6.1.0
+  johboh/nlohmann-json:
+    component_hash: 2a97e10124d755da820b0381e36a9a6504574328f262964ccea3f8b2f228fc66
+    dependencies:
+    - name: idf
+      require: private
+      version: '>=4.4'
+    source:
+      registry_url: https://components.espressif.com/
+      type: service
+    version: 3.12.0
 direct_dependencies:
 - espressif/esp-nn
 - espressif/esp-tflite-micro
 - espressif/network_provisioning
 - idf
-manifest_hash: 217b7b4a74f4e8ff70fe37564de86d215f27d65b38415a70c41a437c4993d3f8
+- johboh/nlohmann-json
+manifest_hash: 8e38ee4d6ac081ebe2f41941d3a4751ead4326bce97c614221fc142f9feedb6b
 target: esp32s3
 version: 3.0.0

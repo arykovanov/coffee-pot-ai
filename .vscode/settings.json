@@ -1,3 +1,4 @@
 {
-    "cmake.sourceDirectory": "${workspaceFolder}/firmware"
+    "cmake.sourceDirectory": "${workspaceFolder}/firmware",
+    "idf.currentSetup": "/home/arykovanov/src/realtimelogic/esp-idf"
 }

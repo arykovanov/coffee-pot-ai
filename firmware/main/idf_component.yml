@@ -1,9 +1,10 @@
 dependencies:
   idf:
-    version: "6.1.0"
+    version: 6.1.0
   espressif/esp-tflite-micro:
-    version: "1.4.3"
+    version: 1.4.3
   espressif/esp-nn:
-    version: "1.5.0"
+    version: 1.5.0
   espressif/network_provisioning:
-    version: "1.4.0"
+    version: 1.4.0
+  johboh/nlohmann-json: =3.12.0
