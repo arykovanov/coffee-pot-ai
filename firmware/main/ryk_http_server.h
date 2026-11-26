@@ -40,6 +40,8 @@ namespace Ryk
   class HttpServer
   {
   public:
+    ~HttpServer();
+
     // Start listening of a port and handling requests
     esp_err_t Start();
 
@@ -51,11 +53,16 @@ namespace Ryk
     static esp_err_t ProcessRequestFunc(httpd_req_t* req);
     esp_err_t ProcessRequest(httpd_req_t* req);
     esp_err_t SetCommonHeaders(httpd_req_t* req);
+    static void WorkerTask(void *p);
 
   private:
     httpd_handle_t hd = nullptr;
     std::map<std::string, HttpHandler> Handlers;
     std::map<std::string, std::string> Headers;
+
+    QueueHandle_t RequestQueue = nullptr;
+    const size_t QueueSize = 3;
+    TaskHandle_t WorkerTaskHandle;
   };
 
   esp_err_t StartHttpServer(Model& model);

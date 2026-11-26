@@ -1,6 +1,7 @@
 #include "ryk_http_server.h"
 #include "ryk_model.h"
 
+#include "freertos/FreeRTOS.h"
 #include <esp_check.h>
 
 #include <algorithm>
@@ -14,6 +15,8 @@
 
 static const char* TAG = "HTTP";
 static const size_t MAX_BODY_SIZE = 16384;
+const int ASYNC_WORKER_TASK_STACK_SIZE = 2560;
+const int ASYNC_WORKER_TASK_PRIORITY = 5;
 
 
 static esp_err_t GetContentLength(httpd_req_t* req, size_t* contentLength)
@@ -96,8 +99,32 @@ namespace Ryk
     return ESP_OK;
   }
 
+  HttpServer::~HttpServer()
+  {
+  }
+
   esp_err_t HttpServer::Start()
   {
+    RequestQueue = xQueueCreate(QueueSize, sizeof(httpd_req_t*));
+    if (RequestQueue == nullptr)
+    {
+      ESP_LOGE(TAG, "Failed to create HTTP request queue");
+      return ESP_FAIL;
+    }
+
+    const auto result = xTaskCreate(
+      &WorkerTask,
+      "HttpServer",
+      ASYNC_WORKER_TASK_STACK_SIZE,
+      this,
+      ASYNC_WORKER_TASK_PRIORITY,
+      &WorkerTaskHandle
+    );
+
+    if (result != pdPASS)
+      return ESP_FAIL;
+
+
     httpd_config_t config = HTTPD_DEFAULT_CONFIG();
     esp_err_t err = ESP_OK;
 
@@ -105,22 +132,67 @@ namespace Ryk
     if (err != ESP_OK)
       ESP_LOGE(TAG, "Failed to start HTTP server.");
 
+
     return err;
   }
 
   esp_err_t HttpServer::ProcessRequestFunc(httpd_req_t* req)
   {
     HttpServer* self = reinterpret_cast<HttpServer*>(req->user_ctx);
-    return self->ProcessRequest(req);
+
+    httpd_req_t* copy = NULL;
+    esp_err_t err = httpd_req_async_handler_begin(req, &copy);
+    ESP_RETURN_ON_ERROR(err, TAG, "Failed to create async request");
+
+    if (xQueueSend(self->RequestQueue, &copy, pdMS_TO_TICKS(100)) != pdPASS)
+    {
+      ESP_LOGE(TAG, "Failed to post async request to queue");
+      if (const esp_err_t err = httpd_req_async_handler_complete(copy))
+        ESP_LOGE(TAG, "Async cleanup failed: %s", esp_err_to_name(err));
+
+      err = self->SetCommonHeaders(req);
+      if (err == ESP_OK)
+        err = httpd_resp_set_status(req, "503 Service unavailable");
+
+      if (err == ESP_OK)
+        err = httpd_resp_sendstr(req, "Server busy. try again later");
+
+      return err;
+    }
+
+    return ESP_OK;
   }
 
   esp_err_t HttpServer::ProcessRequest(httpd_req_t* req)
   {
     Request r(req);
-
     HttpHandler handler = Handlers.at(req->uri);
     SetCommonHeaders(req);
-    return handler(r);
+    esp_err_t err = handler(r);
+    return err;
+  }
+
+  void HttpServer::WorkerTask(void *p)
+  {
+    HttpServer* self = reinterpret_cast<HttpServer*>(p);
+    while (true)
+    {
+      httpd_req_t* req = nullptr;
+      if (xQueueReceive(self->RequestQueue, &req, portMAX_DELAY) == pdPASS)
+      {
+        if (req == nullptr)
+          break;
+
+        esp_err_t err = self->ProcessRequest(req);
+        if (err != ESP_OK)
+          ESP_LOGE(TAG, "Failed to process request");
+
+        if (const esp_err_t e = httpd_req_async_handler_complete(req))
+          ESP_LOGE(TAG, "Failed to complete async request: %i", e);
+      }
+    }
+
+    vTaskDelete(nullptr);
   }
 
   esp_err_t HttpServer::AddHandler(http_method method, const char* path, HttpHandler&& handler)

@@ -1,6 +1,7 @@
 #include "ryk_model.h"
 #include "ryk_http_server.h"
 #include "ryk_network.h"
+#include "ryk_passive_buzzer.h"
 
 #include <esp_check.h>
 #include <esp_heap_caps.h>
@@ -25,7 +26,7 @@ public:
 
 static Ryk::Model model;
 static NVSHolder nvs;
-
+Ryk::PassiveBuzzer buzzer(GPIO_NUM_4);
 
 static esp_err_t HelloHandler(Ryk::Request& req)
 {
@@ -35,6 +36,7 @@ static esp_err_t HelloHandler(Ryk::Request& req)
 static esp_err_t BuzzerHandler(Ryk::Request& req)
 {
   ESP_LOGI(TAG, "BUZZZZZZZZZZZZ");
+  buzzer.playMelody();
   req.SendText("");
   return ESP_OK;
 }

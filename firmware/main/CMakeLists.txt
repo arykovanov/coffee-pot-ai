@@ -3,9 +3,12 @@ idf_component_register(
         "ryk_main.cpp"
         "ryk_network.cpp"
         "ryk_http_server.cpp"
+        "ryk_passive_buzzer.cpp"
         "ryk_model.cpp"
         "ryk_model_data.cpp"
+
     INCLUDE_DIRS "."
+
     PRIV_REQUIRES
         esp_http_server
         esp_timer
@@ -15,6 +18,8 @@ idf_component_register(
         esp_netif
         esp_partition
         esp_adc
+        esp_driver_gpio
+        esp_driver_ledc
         nvs_flash
         network_provisioning
         bt
