@@ -1,5 +1,4 @@
 #include "ryk_http_server.h"
-#include "ryk_model.h"
 
 #include "freertos/FreeRTOS.h"
 #include <esp_check.h>
@@ -17,6 +16,31 @@ static const char* TAG = "HTTP";
 static const size_t MAX_BODY_SIZE = 16384;
 const int ASYNC_WORKER_TASK_STACK_SIZE = 2560;
 const int ASYNC_WORKER_TASK_PRIORITY = 5;
+
+namespace
+{
+  // Balance every producer callback, including error and rejection paths.
+  class SubmissionGuard
+  {
+  public:
+    explicit SubmissionGuard(std::atomic<std::uint32_t>& counter)
+      : Counter(counter)
+    {
+      Counter.fetch_add(1);
+    }
+
+    ~SubmissionGuard()
+    {
+      Counter.fetch_sub(1);
+    }
+
+    SubmissionGuard(const SubmissionGuard&) = delete;
+    SubmissionGuard& operator=(const SubmissionGuard&) = delete;
+
+  private:
+    std::atomic<std::uint32_t>& Counter;
+  };
+}
 
 
 static esp_err_t GetContentLength(httpd_req_t* req, size_t* contentLength)
@@ -101,44 +125,147 @@ namespace Ryk
 
   HttpServer::~HttpServer()
   {
+    // Returning after a failed stop would leave callbacks using a dead object.
+    ESP_ERROR_CHECK(Stop());
+  }
+
+  esp_err_t HttpServer::Stop()
+  {
+    if (WorkerTaskHandle != nullptr && WorkerTaskHandle == xTaskGetCurrentTaskHandle())
+      return ESP_ERR_INVALID_STATE;
+
+    Stopping.store(true);
+    // Callbacks admitted before the transition must finish enqueueing first.
+    // Later callbacks reject requests without touching the work queue.
+    while (ActiveSubmissions.load() != 0)
+      vTaskDelay(1);
+
+    if (WorkerTaskHandle != nullptr)
+    {
+      if (RequestQueue == nullptr)
+        return ESP_ERR_INVALID_STATE;
+
+      const esp_err_t err = StopWorkerTask();
+      if (err != ESP_OK)
+        return err;
+    }
+
+    if (hd != nullptr)
+    {
+      // Async completion needs HTTP server/session state, so stop HTTP last.
+      const esp_err_t err = httpd_stop(hd);
+      if (err != ESP_OK)
+        return err;
+      hd = nullptr;
+    }
+
+    if (RequestQueue != nullptr)
+    {
+      vQueueDelete(RequestQueue);
+      RequestQueue = nullptr;
+    }
+
+    Handlers.clear();
+    Headers.clear();
+    return ESP_OK;
   }
 
   esp_err_t HttpServer::Start()
   {
+    if (hd != nullptr || RequestQueue != nullptr || WorkerTaskHandle != nullptr)
+      return ESP_ERR_INVALID_STATE;
+
     RequestQueue = xQueueCreate(QueueSize, sizeof(httpd_req_t*));
     if (RequestQueue == nullptr)
     {
       ESP_LOGE(TAG, "Failed to create HTTP request queue");
-      return ESP_FAIL;
+      return ESP_ERR_NO_MEM;
     }
 
+    WorkerStopped.store(false);
     const auto result = xTaskCreate(
-      &WorkerTask,
-      "HttpServer",
-      ASYNC_WORKER_TASK_STACK_SIZE,
-      this,
-      ASYNC_WORKER_TASK_PRIORITY,
-      &WorkerTaskHandle
-    );
-
+        &WorkerTask,
+        "HttpServer",
+        ASYNC_WORKER_TASK_STACK_SIZE,
+        this,
+        ASYNC_WORKER_TASK_PRIORITY,
+        &WorkerTaskHandle
+      );
     if (result != pdPASS)
-      return ESP_FAIL;
+    {
+      WorkerStopped.store(true);
+      const esp_err_t cleanupErr = Stop();
+      return cleanupErr == ESP_OK ? ESP_ERR_NO_MEM : cleanupErr;
+    }
 
-
+    Stopping.store(false);
     httpd_config_t config = HTTPD_DEFAULT_CONFIG();
     esp_err_t err = ESP_OK;
-
     err = httpd_start(&hd, &config);
     if (err != ESP_OK)
+    {
       ESP_LOGE(TAG, "Failed to start HTTP server.");
-
+      const esp_err_t cleanupErr = Stop();
+      if (cleanupErr != ESP_OK)
+        return cleanupErr;
+    }
 
     return err;
+  }
+
+  esp_err_t HttpServer::StopWorkerTask()
+  {
+    // FIFO ordering puts the marker after all admitted requests.
+    httpd_req_t* req = nullptr;
+    if (xQueueSend(RequestQueue, &req, portMAX_DELAY) != pdPASS)
+      return ESP_FAIL;
+
+    while (!WorkerStopped.load())
+      vTaskDelay(1);
+
+    WorkerTaskHandle = nullptr;
+    return ESP_OK;
+  }
+
+  void HttpServer::WorkerTask(void *p)
+  {
+    HttpServer* self = reinterpret_cast<HttpServer*>(p);
+    while (true)
+    {
+      httpd_req_t* req = nullptr;
+      if (xQueueReceive(self->RequestQueue, &req, portMAX_DELAY) == pdPASS)
+      {
+        if (req == nullptr)
+          break;
+
+        esp_err_t err = self->ProcessRequest(req);
+        if (err != ESP_OK)
+          ESP_LOGE(TAG, "Failed to process request");
+
+        if (const esp_err_t e = httpd_req_async_handler_complete(req))
+          ESP_LOGE(TAG, "Failed to complete async request: %i", e);
+      }
+    }
+
+    // Last access to self: the owner may now destroy the server and queue.
+    self->WorkerStopped.store(true);
+    vTaskDelete(nullptr);
   }
 
   esp_err_t HttpServer::ProcessRequestFunc(httpd_req_t* req)
   {
     HttpServer* self = reinterpret_cast<HttpServer*>(req->user_ctx);
+
+    SubmissionGuard submission(self->ActiveSubmissions);
+    if (self->Stopping.load())
+    {
+      esp_err_t err = self->SetCommonHeaders(req);
+      if (err == ESP_OK)
+        err = httpd_resp_set_status(req, "503 Service Unavailable");
+      if (err == ESP_OK)
+        err = httpd_resp_sendstr(req, "Server is shutting down.");
+      return err;
+    }
 
     httpd_req_t* copy = NULL;
     esp_err_t err = httpd_req_async_handler_begin(req, &copy);
@@ -170,29 +297,6 @@ namespace Ryk
     SetCommonHeaders(req);
     esp_err_t err = handler(r);
     return err;
-  }
-
-  void HttpServer::WorkerTask(void *p)
-  {
-    HttpServer* self = reinterpret_cast<HttpServer*>(p);
-    while (true)
-    {
-      httpd_req_t* req = nullptr;
-      if (xQueueReceive(self->RequestQueue, &req, portMAX_DELAY) == pdPASS)
-      {
-        if (req == nullptr)
-          break;
-
-        esp_err_t err = self->ProcessRequest(req);
-        if (err != ESP_OK)
-          ESP_LOGE(TAG, "Failed to process request");
-
-        if (const esp_err_t e = httpd_req_async_handler_complete(req))
-          ESP_LOGE(TAG, "Failed to complete async request: %i", e);
-      }
-    }
-
-    vTaskDelete(nullptr);
   }
 
   esp_err_t HttpServer::AddHandler(http_method method, const char* path, HttpHandler&& handler)
@@ -238,20 +342,3 @@ namespace Ryk
   }
 
 } // namespace Ryk
-
-
-esp_err_t Ryk::StartHttpServer(Model& model)
-{
-  httpd_handle_t hd = nullptr;
-  httpd_config_t config = HTTPD_DEFAULT_CONFIG();
-  esp_err_t err = ESP_OK;
-
-  err = httpd_start(&hd, &config);
-  if (err != ESP_OK)
-    ESP_LOGE(TAG, "Failed to start HTTP server.");
-
-  if (err != ESP_OK && hd != nullptr)
-    httpd_stop(hd);
-
-  return err;
-}
