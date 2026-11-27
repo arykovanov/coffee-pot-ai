@@ -33,10 +33,41 @@ static esp_err_t HelloHandler(Ryk::Request& req)
   return req.SendText("Hello");
 }
 
+static esp_err_t SetBuzzerConfig(Ryk::Request& req)
+{
+  nlohmann::json config;
+  esp_err_t err = req.ReceiveJson(config);
+  if (err != ESP_OK)
+  {
+    req.SendError(httpd_err_code_t::HTTPD_400_BAD_REQUEST, "Invalid JSON");
+    return ESP_OK;
+  }
+
+  auto pinIt = config.find("pin");
+  if (pinIt == config.end() || !pinIt->is_number_unsigned())
+  {
+    req.SendError(httpd_err_code_t::HTTPD_400_BAD_REQUEST, "Invalid Pin");
+    return ESP_OK;
+  }
+
+  gpio_num_t pin = static_cast<gpio_num_t>(*pinIt);
+  if (pin > GPIO_NUM_MAX)
+  {
+    req.SendError(httpd_err_code_t::HTTPD_400_BAD_REQUEST, "Invalid Pin");
+    return ESP_OK;
+  }
+
+  buzzer.SetPin(pin);
+
+  req.SendText( "");
+
+  return ESP_OK;
+}
+
 static esp_err_t BuzzerHandler(Ryk::Request& req)
 {
   ESP_LOGI(TAG, "BUZZZZZZZZZZZZ");
-  buzzer.playMelody();
+  buzzer.PlayMelody();
   req.SendText("");
   return ESP_OK;
 }
@@ -81,5 +112,7 @@ void app_main(void)
   Server.Start();
   Server.AddCommonHeader("Access-Control-Allow-Origin", "*");
   Server.AddHandler(http_method::HTTP_GET, "/", HelloHandler);
+
   Server.AddHandler(http_method::HTTP_POST, "/buzz", BuzzerHandler);
+  Server.AddHandler(http_method::HTTP_POST, "/buzz/config", SetBuzzerConfig);
 }

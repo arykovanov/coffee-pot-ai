@@ -5,9 +5,11 @@
 
 #include <algorithm>
 #include <charconv>
+#include <cctype>
 #include <cstdint>
 #include <limits>
 #include <string>
+#include <string_view>
 #include <vector>
 #include <sstream>
 
@@ -19,6 +21,27 @@ const int ASYNC_WORKER_TASK_PRIORITY = 5;
 
 namespace
 {
+  const char* GetErrorStatus(httpd_err_code_t error)
+  {
+    switch (error)
+    {
+      case HTTPD_501_METHOD_NOT_IMPLEMENTED: return "501 Not Implemented";
+      case HTTPD_505_VERSION_NOT_SUPPORTED: return "505 HTTP Version Not Supported";
+      case HTTPD_400_BAD_REQUEST: return "400 Bad Request";
+      case HTTPD_401_UNAUTHORIZED: return "401 Unauthorized";
+      case HTTPD_403_FORBIDDEN: return "403 Forbidden";
+      case HTTPD_404_NOT_FOUND: return "404 Not Found";
+      case HTTPD_405_METHOD_NOT_ALLOWED: return "405 Method Not Allowed";
+      case HTTPD_408_REQ_TIMEOUT: return "408 Request Timeout";
+      case HTTPD_414_URI_TOO_LONG: return "414 URI Too Long";
+      case HTTPD_411_LENGTH_REQUIRED: return "411 Length Required";
+      case HTTPD_413_CONTENT_TOO_LARGE: return "413 Content Too Large";
+      case HTTPD_431_REQ_HDR_FIELDS_TOO_LARGE: return "431 Request Header Fields Too Large";
+      case HTTPD_500_INTERNAL_SERVER_ERROR:
+      default: return "500 Internal Server Error";
+    }
+  }
+
   // Balance every producer callback, including error and rejection paths.
   class SubmissionGuard
   {
@@ -81,6 +104,47 @@ namespace Ryk
 {
   esp_err_t Request::ReceiveJson(nlohmann::json& body)
   {
+    body = nullptr;
+    const size_t headerLen = httpd_req_get_hdr_value_len(RawRequest, "Content-Type");
+    if (headerLen == 0)
+      return ESP_ERR_INVALID_ARG;
+
+    std::string contentType(headerLen + 1, '\0');
+    const esp_err_t headerErr = httpd_req_get_hdr_value_str(
+        RawRequest, "Content-Type", contentType.data(), contentType.size());
+    if (headerErr != ESP_OK)
+      return headerErr;
+    contentType.resize(headerLen);
+
+    // Media types are case-insensitive; parameters do not change the type.
+    auto mediaType = std::string_view(contentType).substr(0, contentType.find(';'));
+    const auto first = mediaType.find_first_not_of(" \t");
+    if (first == std::string_view::npos)
+      return ESP_ERR_INVALID_ARG;
+    mediaType.remove_prefix(first);
+    mediaType = mediaType.substr(0, mediaType.find_last_not_of(" \t") + 1);
+
+    constexpr std::string_view expectedType = HTTPD_TYPE_JSON;
+    if (mediaType.size() != expectedType.size()
+        || !std::equal(mediaType.begin(), mediaType.end(), expectedType.begin(),
+                       [](unsigned char actual, char expected)
+                       { return std::tolower(actual) == expected; }))
+      return ESP_ERR_INVALID_ARG;
+
+    std::string payload;
+    const esp_err_t err = ReceiveBody(payload, MAX_BODY_SIZE);
+    if (err != ESP_OK)
+      return err;
+
+    // The parser treats a raw NUL as end-of-input, but JSON forbids raw NULs.
+    if (payload.find('\0') != std::string::npos)
+      return ESP_ERR_INVALID_ARG;
+
+    auto parsed = nlohmann::json::parse(payload, nullptr, false);
+    if (parsed.is_discarded())
+      return ESP_ERR_INVALID_ARG;
+
+    body.swap(parsed);
     return ESP_OK;
   }
 
@@ -92,6 +156,30 @@ namespace Ryk
   esp_err_t Request::SendText(const char* body)
   {
     return httpd_resp_send(RawRequest, body, HTTPD_RESP_USE_STRLEN);
+  }
+
+  esp_err_t Request::SendError(httpd_err_code_t error, const char* body)
+  {
+    return httpd_resp_send_err(RawRequest, error, body);
+  }
+
+  esp_err_t Request::SendError(httpd_err_code_t error, const nlohmann::json& body)
+  {
+    if (body.is_discarded())
+      return ESP_ERR_INVALID_ARG;
+
+    // Replace invalid UTF-8 rather than throwing in this exception-free build.
+    const std::string payload = body.dump(-1, ' ', false,
+                                         nlohmann::json::error_handler_t::replace);
+    esp_err_t err = httpd_resp_set_status(RawRequest, GetErrorStatus(error));
+    if (err != ESP_OK)
+      return err;
+
+    err = httpd_resp_set_type(RawRequest, HTTPD_TYPE_JSON);
+    if (err != ESP_OK)
+      return err;
+
+    return httpd_resp_send(RawRequest, payload.data(), payload.size());
   }
 
   esp_err_t Request::ReceiveBody(std::string& body, size_t maxSize)

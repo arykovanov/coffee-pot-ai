@@ -21,6 +21,10 @@ namespace Ryk
   class Request
   {
   public:
+    // Require application/json (case-insensitive, parameters allowed), then
+    // read up to 16 KiB and parse any JSON value; output is null on failure.
+    // Missing/wrong Content-Type or invalid JSON returns ESP_ERR_INVALID_ARG;
+    // header/body-read errors are propagated.
     esp_err_t ReceiveJson(nlohmann::json& body);
     esp_err_t SendJson(const nlohmann::json& body);
 
@@ -28,6 +32,9 @@ namespace Ryk
 
     esp_err_t SendText(const char* body);
 
+    // Send an HTTP error response and return its transmission result.
+    // A null text body selects ESP-IDF's default message for the error.
+    // The JSON overload uses application/json and replaces invalid UTF-8.
     esp_err_t SendError(httpd_err_code_t error, const char* body);
     esp_err_t SendError(httpd_err_code_t error, const nlohmann::json& body);
 

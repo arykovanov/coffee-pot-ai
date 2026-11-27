@@ -23,6 +23,17 @@ namespace
     return (frequencyHz == 0 || (frequencyHz >= 100 && frequencyHz <= 20000))
            && durationMs >= 1 && durationMs <= 60000;
   }
+
+  constexpr bool IsValidPin(gpio_num_t pin, ledc_timer_t timer,
+                             ledc_channel_t channel)
+  {
+    if (!GPIO_IS_VALID_OUTPUT_GPIO(pin)
+        || static_cast<unsigned>(timer) >= LEDC_TIMER_MAX
+        || static_cast<unsigned>(channel) >= LEDC_CHANNEL_MAX)
+      return false;
+
+    return true;
+  }
 }
 
 namespace Ryk
@@ -33,7 +44,24 @@ namespace Ryk
   {
   }
 
+
   PassiveBuzzer::~PassiveBuzzer()
+  {
+    Deinit();
+  }
+
+  esp_err_t PassiveBuzzer::SetPin(gpio_num_t pin)
+  {
+    if (!IsValidPin(pin, Timer, Channel))
+      return ESP_ERR_INVALID_ARG;
+
+    std::lock_guard lock(InitMutex);
+    Deinit();
+    Pin = pin;
+    return Init();
+  }
+
+  void PassiveBuzzer::Deinit()
   {
     if (ChannelInitialised)
     {
@@ -43,6 +71,8 @@ namespace Ryk
       config.channel = Channel;
       config.deconfigure = true;
       (void)ledc_channel_config(&config);
+
+      ChannelInitialised =false;
     }
 
     if (TimerInitialised)
@@ -53,6 +83,7 @@ namespace Ryk
       config.timer_num = Timer;
       config.deconfigure = true;
       (void)ledc_timer_config(&config);
+      TimerInitialised = false;
     }
   }
 
@@ -61,9 +92,7 @@ namespace Ryk
     if (ChannelInitialised)
       return ESP_OK;
 
-    if (!GPIO_IS_VALID_OUTPUT_GPIO(Pin)
-        || static_cast<unsigned>(Timer) >= LEDC_TIMER_MAX
-        || static_cast<unsigned>(Channel) >= LEDC_CHANNEL_MAX)
+    if (!IsValidPin(Pin, Timer, Channel))
       return ESP_ERR_INVALID_ARG;
 
     if (!TimerInitialised)
@@ -95,7 +124,14 @@ namespace Ryk
     return ESP_OK;
   }
 
-  esp_err_t PassiveBuzzer::playTone(std::uint32_t frequencyHz,
+  esp_err_t PassiveBuzzer::PlayTone(std::uint32_t frequencyHz,
+                                   std::uint32_t durationMs)
+  {
+    std::lock_guard loc(InitMutex);
+    return playToneInt(frequencyHz, durationMs);
+  }
+
+  esp_err_t PassiveBuzzer::playToneInt(std::uint32_t frequencyHz,
                                    std::uint32_t durationMs)
   {
     if (!IsValidTone(frequencyHz, durationMs))
@@ -131,10 +167,10 @@ namespace Ryk
     return ledc_stop(SpeedMode, Channel, 0);
   }
 
-  esp_err_t PassiveBuzzer::playMelody(std::span<const Tone> melody)
+  esp_err_t PassiveBuzzer::PlayMelody(std::span<const Tone> melody)
   {
     if (melody.empty())
-      melody = DefaultMelody;
+    melody = DefaultMelody;
 
     // Reject invalid sequences before producing any sound.
     for (const Tone& tone : melody)
@@ -143,9 +179,10 @@ namespace Ryk
         return ESP_ERR_INVALID_ARG;
     }
 
+    std::lock_guard loc(InitMutex);
     for (const Tone& tone : melody)
     {
-      const esp_err_t err = playTone(tone.frequencyHz, tone.durationMs);
+      const esp_err_t err = playToneInt(tone.frequencyHz, tone.durationMs);
       if (err != ESP_OK)
         return err;
     }
